@@ -1,9 +1,8 @@
-# streamlit_lead_bucket_app.py
+# streamlit_lead_bucket_app.py (updated)
 # Streamlit app: Lead bucketing + system-message generation
-# - Buckets: google, meta_main (Meta + user_set==main_set), meta_experiment (Meta + user_set==experiment), others
-# - Treats lead_source "facebook" / "fb" as "meta"
-# - UI supports column mapping, per-bucket CSV/Excel download, ZIP download
-# - System-message generator: outputs lead_id + "autopay_status=..., started_yesterday=..., completed_yesterday=..."
+# Changes made:
+# - When generating system messages, the output CSVs use two fields: lead_id and message_content
+# - Removed Excel outputs for system messages; now CSV per-bucket + ZIP of CSVs
 
 import streamlit as st
 import pandas as pd
@@ -38,12 +37,14 @@ COLUMN_VARIANTS = {
     "completed_yesterday": ["completed_yesterday", "completed yesterday", "completed_yday"]
 }
 
+
 def read_uploaded_file(uploaded_file) -> pd.DataFrame:
     name = uploaded_file.name.lower()
     if name.endswith('.csv'):
         return pd.read_csv(uploaded_file)
     else:
         return pd.read_excel(uploaded_file)
+
 
 def suggest_column(df: pd.DataFrame, variants: List[str]):
     cols = list(df.columns)
@@ -52,6 +53,7 @@ def suggest_column(df: pd.DataFrame, variants: List[str]):
         if v.lower() in lower_cols:
             return cols[lower_cols.index(v.lower())]
     return None
+
 
 def auto_map_columns(df: pd.DataFrame) -> Dict[str, str]:
     mapping = {}
@@ -98,15 +100,25 @@ def classify_df(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
         'others_bucket': others_bucket
     }
 
-def generate_system_messages_for_bucket(df: pd.DataFrame, lead_id_col: str) -> pd.DataFrame:
+
+def generate_system_messages_for_bucket(df: pd.DataFrame, lead_id_col: str = 'lead_id') -> pd.DataFrame:
+    """
+    Produce a DataFrame with exactly two columns: 'lead_id' and 'message_content'.
+    If the source df has a column named lead_id_col, use it; otherwise fall back to index string.
+    """
     working = df.copy()
     # Ensure presence of status columns
     for col in ['autopay_status', 'started_yesterday', 'completed_yesterday']:
         if col not in working.columns:
             working[col] = ''
-    # Ensure lead_id column
-    if lead_id_col not in working.columns:
-        working[lead_id_col] = working.index.astype(str)
+
+    # Determine values for lead_id
+    if lead_id_col in working.columns:
+        lead_ids = working[lead_id_col].astype(str)
+    elif 'lead_id' in working.columns:
+        lead_ids = working['lead_id'].astype(str)
+    else:
+        lead_ids = working.index.astype(str)
 
     def make_message(row):
         a = str(row.get('autopay_status', '')).strip()
@@ -114,9 +126,11 @@ def generate_system_messages_for_bucket(df: pd.DataFrame, lead_id_col: str) -> p
         c = str(row.get('completed_yesterday', '')).strip()
         return f"autopay_status={a}, started_yesterday={s}, completed_yesterday={c}"
 
+    messages = working.apply(make_message, axis=1)
+
     out = pd.DataFrame({
-        lead_id_col: working[lead_id_col],
-        'system_message': working.apply(make_message, axis=1)
+        'lead_id': lead_ids.values,
+        'message_content': messages.values
     })
 
     return out
@@ -206,17 +220,7 @@ if uploaded_file is not None:
 
             outputs = {}
             for key, bdf in buckets.items():
-                # Ensure lead_id exists in bucket
-                if lead_id_col not in bdf.columns:
-                    bdf = bdf.copy()
-                    if 'lead_id' in working_df.columns:
-                        # align by index
-                        try:
-                            bdf['lead_id'] = working_df.loc[bdf.index, 'lead_id']
-                        except Exception:
-                            bdf['lead_id'] = bdf.index.astype(str)
-                    else:
-                        bdf['lead_id'] = bdf.index.astype(str)
+                # Ensure lead_id exists in bucket (we'll handle inside generator)
                 system_df = generate_system_messages_for_bucket(bdf, lead_id_col)
                 outputs[key] = system_df
 
@@ -225,29 +229,23 @@ if uploaded_file is not None:
             st.write("**Counts:**")
             st.json(counts)
 
-            # Provide download for each bucket as separate Excel file
+            # Provide download for each bucket as CSV (two columns: lead_id, message_content)
             for key, outdf in outputs.items():
                 st.subheader(f"{key} — {len(outdf)} leads")
                 st.dataframe(outdf.head(10))
 
-                towrite = io.BytesIO()
-                with pd.ExcelWriter(towrite, engine='openpyxl') as writer:
-                    outdf.to_excel(writer, index=False, sheet_name=key[:31])
-                towrite.seek(0)
-                st.download_button(label=f"Download {key}.xlsx", data=towrite, file_name=f"{key}.xlsx", mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+                csv_bytes = outdf.to_csv(index=False).encode('utf-8')
+                st.download_button(label=f"Download {key}.csv", data=csv_bytes, file_name=f"{key}.csv", mime='text/csv')
 
-            # Option: download all as a single ZIP of excels
-            if st.button("Download all system-message excels as ZIP"):
+            # Option: download all as a single ZIP of CSVs
+            if st.button("Download all system-message CSVs as ZIP"):
                 zip_buffer = io.BytesIO()
                 with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
                     for key, outdf in outputs.items():
-                        towrite = io.BytesIO()
-                        with pd.ExcelWriter(towrite, engine='openpyxl') as writer:
-                            outdf.to_excel(writer, index=False, sheet_name=key[:31])
-                        towrite.seek(0)
-                        zf.writestr(f"{key}.xlsx", towrite.read())
+                        csv_data = outdf.to_csv(index=False).encode('utf-8')
+                        zf.writestr(f"{key}.csv", csv_data)
                 zip_buffer.seek(0)
-                st.download_button(label="Download ZIP of all bucket excels", data=zip_buffer, file_name="system_messages_buckets.zip", mime='application/zip')
+                st.download_button(label="Download ZIP of all bucket CSVs", data=zip_buffer, file_name="system_messages_buckets.zip", mime='application/zip')
 
     st.markdown("---")
     st.write("Need extra features? Reply with: 'export to separate sheets in one Excel' or 'filter where monthly_fees > 0' or 'add other rules' and I'll extend the app.")
